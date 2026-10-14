@@ -5,6 +5,7 @@ import (
 	"io"
 	"net"
 	"os"
+	"sync"
 	"time"
 
 	"github.com/sagernet/sing/common"
@@ -13,15 +14,21 @@ import (
 )
 
 type httpConn struct {
-	reader io.Reader
-	writer io.Writer
-	create chan struct{}
-	err    error
-	cancel context.CancelFunc
+	access    sync.Mutex
+	closed    bool
+	done      chan struct{}
+	closeOnce sync.Once
+	closeErr  error
+	reader    io.Reader
+	writer    io.Writer
+	create    chan struct{}
+	err       error
+	cancel    context.CancelFunc
 }
 
 func newHTTPConn(reader io.Reader, writer io.Writer) *httpConn {
 	return &httpConn{
+		done:   make(chan struct{}),
 		reader: reader,
 		writer: writer,
 	}
@@ -29,6 +36,7 @@ func newHTTPConn(reader io.Reader, writer io.Writer) *httpConn {
 
 func newLateHTTPConn(writer io.Writer, cancel context.CancelFunc) *httpConn {
 	return &httpConn{
+		done:   make(chan struct{}),
 		create: make(chan struct{}),
 		writer: writer,
 		cancel: cancel,
@@ -36,19 +44,42 @@ func newLateHTTPConn(writer io.Writer, cancel context.CancelFunc) *httpConn {
 }
 
 func (c *httpConn) setup(reader io.Reader, err error) {
-	c.reader = reader
-	c.err = err
+	c.access.Lock()
+	closed := c.closed
+	if closed {
+		c.err = net.ErrClosed
+	} else {
+		c.reader = reader
+		c.err = err
+	}
 	close(c.create)
+	c.access.Unlock()
+	// A response arriving after Close still belongs to this exact connection.
+	if closed {
+		_ = common.Close(reader)
+	}
 }
 
 func (c *httpConn) Read(b []byte) (n int, err error) {
-	if c.reader == nil {
-		<-c.create
-		if c.err != nil {
-			return 0, c.err
+	// Always observe response publication before looking at reader/err.
+	// Testing reader first races with asynchronous successful setup.
+	if c.create != nil {
+		select {
+		case <-c.create:
+		case <-c.done:
+			return 0, net.ErrClosed
 		}
 	}
-	n, err = c.reader.Read(b)
+	c.access.Lock()
+	reader, setupErr, closed := c.reader, c.err, c.closed
+	c.access.Unlock()
+	if closed {
+		return 0, net.ErrClosed
+	}
+	if setupErr != nil {
+		return 0, setupErr
+	}
+	n, err = reader.Read(b)
 	return n, baderror.WrapH2(err)
 }
 
@@ -58,10 +89,20 @@ func (c *httpConn) Write(b []byte) (n int, err error) {
 }
 
 func (c *httpConn) Close() error {
-	if c.cancel != nil {
-		c.cancel()
-	}
-	return common.Close(c.reader, c.writer)
+	c.closeOnce.Do(func() {
+		c.access.Lock()
+		c.closed = true
+		reader := c.reader
+		if c.done != nil {
+			close(c.done)
+		}
+		c.access.Unlock()
+		if c.cancel != nil {
+			c.cancel()
+		}
+		c.closeErr = common.Close(reader, c.writer)
+	})
+	return c.closeErr
 }
 
 func (c *httpConn) CloseWrite() error {
