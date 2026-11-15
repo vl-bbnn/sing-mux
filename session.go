@@ -127,6 +127,13 @@ func (w *yamuxWrapStream) Upstream() any {
 func smuxConfig() *smux.Config {
 	config := smux.DefaultConfig()
 	config.KeepAliveDisabled = true
+	// The upstream 64 KiB per-stream window forces a window update in the
+	// middle of even a small download.  On a high-latency reliable underlay
+	// that stalls many concurrent streams behind an extra round trip.  Keep
+	// enough aggregate credit for a full set of active streams while bounding
+	// the memory retained by one session.
+	config.MaxStreamBuffer = 256 * 1024
+	config.MaxReceiveBuffer = 16 * 1024 * 1024
 	return config
 }
 
